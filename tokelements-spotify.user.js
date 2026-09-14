@@ -1,0 +1,398 @@
+// ==UserScript==
+// @name         TokElements for Spotify
+// @namespace    tokelements.spotify
+// @version      0.6.0
+// @description  Drive your logged-in Spotify web player for TokElements (now-playing overlay + song requests + skip). No Spotify app / client-id needed. One-click pairing when TokElements runs in the same browser.
+// @author       TokElements
+// @homepageURL  https://github.com/tokelements/tokelements-spotify
+// @supportURL   https://github.com/tokelements/tokelements-spotify/issues
+// @updateURL    https://raw.githubusercontent.com/tokelements/tokelements-spotify/main/tokelements-spotify.user.js
+// @downloadURL  https://raw.githubusercontent.com/tokelements/tokelements-spotify/main/tokelements-spotify.user.js
+// @match        https://open.spotify.com/*
+// @match        http://localhost:3000/*
+// @match        http://127.0.0.1:3000/*
+// @match        https://*.tokelements.com/*
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_registerMenuCommand
+// @connect      *
+// ==/UserScript==
+
+/*
+  Two roles, chosen by the page it runs on:
+
+  1) On a TokElements page  → "bridge". Lets the Spotify settings page pair with ONE click (same browser):
+       page  →  { __te_spotify:'pair', code, teUrl }   → we store it (GM_setValue, shared across tabs)
+       we    →  { __te_spotify:'agent-present' | 'paired' | 'unpaired' }  → page updates its UI
+     No code typing needed. GM values are shared, so the open.spotify.com tab picks them up live.
+
+  2) On open.spotify.com   → the "agent". Reads now-playing from the player DOM, grabs the player's own
+     Bearer token (fetch/XHR/WS hooks), and talks to TokElements over GM_xmlhttpRequest (CSP/CORS-safe):
+       POST <TE>/api/spotify/agent/state?code=<pair>    { nowPlaying, premium, connected:true }   (+15s heartbeat)
+       GET  <TE>/api/spotify/agent/commands?code=<pair>&since=<n>  → { commands:[…], seq }
+       POST <TE>/api/spotify/agent/ack?code=<pair>       { id, ok, error?, added? }
+
+  For a different browser / another computer: open the TokElements Spotify page, copy the pairing code,
+  and enter it here via the Tampermonkey menu → "TokElements: set pairing code" (+ "set URL").
+*/
+
+(function () {
+  'use strict';
+
+  const HOST = location.hostname;
+  const IS_TE = HOST === 'localhost' || HOST === '127.0.0.1' || /(^|\.)tokelements\.com$/.test(HOST);
+  const IS_SPOTIFY = HOST === 'open.spotify.com';
+  if (!IS_TE && !IS_SPOTIFY) return;
+
+  // ============================ ROLE 1: bridge on the TokElements page ============================
+  if (IS_TE) {
+    const post = (msg) => { try { window.postMessage(Object.assign({ __te_spotify_from: 'agent' }, msg), location.origin); } catch (e) {} };
+    const announce = () => post({ __te_spotify: 'agent-present', version: '0.6.0' });
+    // keep announcing briefly so the page shows the one-click button even if we loaded first
+    announce();
+    let n = 0; const iv = setInterval(() => { announce(); if (++n > 12) clearInterval(iv); }, 1200);
+    window.addEventListener('message', (e) => {
+      // NOTE: no e.source check — in the Tampermonkey sandbox `window` is a proxy that is not identical
+      // to the page window, so `e.source !== window` would wrongly drop the page's own messages. Origin +
+      // the __te_spotify namespace are the guards.
+      if (e.origin !== location.origin) return;
+      const d = e.data || {};
+      if (!d || d.__te_spotify_from === 'agent') return; // ignore our own
+      if (d.__te_spotify === 'page-hello') return announce();
+      if (d.__te_spotify === 'pair' && d.code) {
+        GM_setValue('teUrl', String(d.teUrl || location.origin).replace(/\/$/, ''));
+        GM_setValue('pairCode', String(d.code).trim());
+        post({ __te_spotify: 'paired' });
+      }
+      if (d.__te_spotify === 'unpair') { GM_deleteValue('pairCode'); post({ __te_spotify: 'unpaired' }); }
+    });
+    return;
+  }
+
+  // ============================ ROLE 2: agent on open.spotify.com ============================
+  const S = {
+    teUrl: (GM_getValue('teUrl', '') || '').replace(/\/$/, ''),
+    pairCode: GM_getValue('pairCode', ''),
+    token: null, clientToken: null, deviceId: null, spBase: null, np: null, premium: null, seq: 0, loggedOut: false, lastResult: null,
+    queue: [],           // up-next tracks captured from the web player's internal state (no rate limit)
+    online: null,        // last TokElements POST reachable?
+    lastPushOk: 0,
+  };
+  // live-update when the bridge (TokElements page) pairs/unpairs in another tab
+  if (typeof GM_addValueChangeListener === 'function') {
+    GM_addValueChangeListener('pairCode', (_k, _o, v) => { S.pairCode = v || ''; hud(); });
+    GM_addValueChangeListener('teUrl', (_k, _o, v) => { S.teUrl = (v || '').replace(/\/$/, ''); hud(); });
+  }
+
+  // ---- token capture: hook the player's own auth'd requests ----
+  (function hookToken() {
+    const grab = (headers) => {
+      try {
+        let auth = null, ct = null;
+        if (headers && typeof headers.forEach === 'function') headers.forEach((v, k) => { const kk = String(k).toLowerCase(); if (kk === 'authorization') auth = v; if (kk === 'client-token') ct = v; });
+        else if (headers) for (const k in headers) { const kk = k.toLowerCase(); if (kk === 'authorization') auth = headers[k]; if (kk === 'client-token') ct = headers[k]; }
+        if (auth && /^Bearer /i.test(auth)) S.token = auth.slice(7);
+        if (ct) S.clientToken = ct;
+      } catch (e) {}
+    };
+    const of = window.fetch;
+    if (of) window.fetch = function (input, init) {
+      try { grab((init && init.headers) || (input && input.headers)); } catch (e) {}
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const pr = of.apply(this, arguments);
+      // The web player's INTERNAL state endpoint returns the up-next tracks (with cover/artist) and is
+      // NOT rate-limited like api.spotify.com. Piggyback on it — clone the response and parse the queue.
+      if (/\/track-playback\/v1\/devices\/[^/]+\/state\b/.test(url)) {
+        try { const mm = url.match(/^(https?:\/\/[^/]+)\/track-playback\/v1\/devices\/([^/]+)\/state/); if (mm) { S.spBase = mm[1]; S.deviceId = mm[2]; } } catch (e) {}
+        try { pr.then((r) => { try { r.clone().json().then(parseState).catch(() => {}); } catch (e) {} }); } catch (e) {}
+      }
+      return pr;
+    };
+    const oh = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function (k, v) { if (/^authorization$/i.test(k) && /^Bearer /i.test(v)) S.token = v.slice(7); if (/^client-token$/i.test(k)) S.clientToken = v; return oh.apply(this, arguments); };
+    const OW = window.WebSocket;
+    if (OW) { window.WebSocket = function (url, p) { try { const m = String(url).match(/access_token=([^&]+)/); if (m) S.token = decodeURIComponent(m[1]); } catch (e) {} return p !== undefined ? new OW(url, p) : new OW(url); }; window.WebSocket.prototype = OW.prototype; }
+  })();
+
+  // ---- now-playing from the DOM ----
+  const $ = (s) => document.querySelector(s);
+  const mmss = (t) => { const m = String(t || '').match(/(\d+):(\d+)/); return m ? +m[1] * 60 + +m[2] : null; };
+  let lastPos = null, lastPosAt = 0;
+  function readNP() {
+    // Read from the now-playing bar DOM — it holds the track whether PLAYING or PAUSED. The tab title
+    // drops the track when paused/browsing, which made paused songs show as "nothing playing". The
+    // track/artist LINKS are locale-independent (the widget's aria-label is localized, so we avoid it).
+    const w = $('[data-testid="now-playing-widget"]');
+    let track = null, artist = null, cover = null;
+    if (w) {
+      const tl = w.querySelector('[data-testid="context-item-link"]') || w.querySelector('a[href*="/track/"]');
+      if (tl) track = (tl.textContent || '').trim() || null;
+      const als = w.querySelectorAll('a[href*="/artist/"]');
+      if (als.length) artist = Array.prototype.map.call(als, (a) => (a.textContent || '').trim()).filter(Boolean).join(', ') || null;
+      const im = w.querySelector('img[src*="i.scdn.co"]');
+      if (im) cover = im.getAttribute('src');
+    }
+    if (!track) { const title = document.title || ''; const i = title.lastIndexOf(' • '); if (i > 0) { track = title.slice(0, i).trim(); if (!artist) artist = title.slice(i + 3).trim(); } }
+    if (!cover) { const c2 = $('img[src*="i.scdn.co/image"]'); if (c2) cover = c2.getAttribute('src'); }
+    const pos = mmss(($('[data-testid="playback-position"]') || {}).textContent);
+    const dur = mmss(($('[data-testid="playback-duration"]') || {}).textContent);
+    let playing = track ? null : false;
+    if (pos != null) { if (lastPos != null && pos > lastPos) playing = true; else if (lastPos === pos && Date.now() - lastPosAt > 1500) playing = false; lastPos = pos; lastPosAt = Date.now(); }
+    return { track, artist, cover, positionMs: pos != null ? pos * 1000 : null, durationMs: dur != null ? dur * 1000 : null, playing };
+  }
+
+  // Derive the up-next queue from the web player's internal /track-playback state-machine response.
+  // tracks[] is the context window; the current track index comes from the updated_state_ref → states[].
+  function parseState(body) {
+    try {
+      const sm = body && body.state_machine; if (!sm || !sm.tracks || !sm.states) return;
+      const ref = body.updated_state_ref || {};
+      const cur = (ref.state_index != null && sm.states[ref.state_index]) ? sm.states[ref.state_index].track : null;
+      const list = sm.tracks.map((t) => {
+        const m = (t && t.metadata) || {}; const im = m.images || [];
+        return {
+          uri: m.uri || null,
+          title: m.name || '',
+          artist: (m.authors || []).map((a) => a && a.name).filter(Boolean).join(', '),
+          image: (im[2] && im[2].url) || (im[1] && im[1].url) || (im[0] && im[0].url) || null,
+          durationMs: m.duration || 0,
+        };
+      });
+      const q = (cur != null) ? list.slice(cur + 1) : list;
+      S.queue = q.slice(0, 8);
+    } catch (e) {}
+  }
+
+  /*
+   * Signed in, or just a login page?
+   *
+   * Only answered when the page is showing one or the other: during the first render neither marker
+   * is there, and calling that "signed out" would put a red warning in the streamer's studio every
+   * time they open the tab.
+   */
+  function readLoggedOut() {
+    const signedIn = $('[data-testid="user-widget-link"]') || $('[data-testid="user-widget-avatar"]') || $('[data-testid="now-playing-widget"]') || $('[data-testid="control-button-playpause"]');
+    if (signedIn) return false;
+    const login = $('[data-testid="login-button"]') || document.querySelector('a[href^="/login"], a[href*="accounts.spotify.com/login"]');
+    return !!login;
+  }
+
+  /*
+   * The player bar is rebuilt when Spotify navigates and for a moment between two songs, so a raw
+   * read says "nothing playing" every so often while music is in fact playing. On the overlay that
+   * is a widget blinking to its empty state and back. Hold the last track for a few seconds before
+   * believing that the music stopped.
+   */
+  let emptyReads = 0, lastGood = null;
+  function stableNP() {
+    const np = readNP();
+    if (np && np.track) { emptyReads = 0; lastGood = np; return np; }
+    emptyReads++;
+    if (lastGood && emptyReads <= 4) return lastGood;
+    lastGood = null;
+    return np;
+  }
+
+  /*
+   * Playback control: click the player's own buttons, and if they are not there, send the command
+   * the web app itself sends.
+   *
+   * The buttons carry test ids that Spotify renames from time to time, and they are missing
+   * entirely while the player is still booting — a skip bought with a viewer's points must not be
+   * lost to either. The internal command runs against the same device the tab is playing on, which
+   * is what the web UI does under its own buttons.
+   */
+  const CTRL = { play: '[data-testid="control-button-playpause"]', pause: '[data-testid="control-button-playpause"]', playpause: '[data-testid="control-button-playpause"]', next: '[data-testid="control-button-skip-forward"]', prev: '[data-testid="control-button-skip-back"]' };
+  const INTERNAL_CTRL = { next: 'skip_next', prev: 'skip_prev', play: 'resume', pause: 'pause', playpause: null };
+
+  function deviceCommand(endpoint) {
+    return new Promise((resolve) => {
+      if (!S.token || !S.spBase || !S.deviceId || !endpoint) return resolve(false);
+      const headers = { authorization: 'Bearer ' + S.token, 'content-type': 'application/json', accept: 'application/json' };
+      if (S.clientToken) headers['client-token'] = S.clientToken;
+      GM_xmlhttpRequest({
+        method: 'POST', url: S.spBase + '/connect-state/v1/player/command/from/' + S.deviceId + '/to/' + S.deviceId,
+        headers, data: JSON.stringify({ command: { endpoint } }),
+        onload: (r) => resolve(r.status >= 200 && r.status < 300),
+        onerror: () => resolve(false),
+      });
+    });
+  }
+
+  async function control(cmd) {
+    const el = $(CTRL[cmd]);
+    // A disabled button is a player that has nothing loaded; clicking it does nothing at all.
+    if (el && !el.disabled) { el.click(); return true; }
+    if (cmd === 'playpause') return !!el && (el.click(), true);
+    return deviceCommand(INTERNAL_CTRL[cmd]);
+  }
+
+  /*
+   * Whether song requests are possible is decided by trying, never by reading the page.
+   *
+   * This used to set "no Premium" the moment it saw an Explore Premium button, and then TokElements
+   * refused every request before the script even saw it. Measured on a free account: the internal
+   * command the web player uses for its own queue accepts add_to_queue and skip_next perfectly well.
+   * It is the PUBLIC Web API that needs Premium, and that is only ever the fallback. So premium
+   * stays unknown until a request is actually refused, and only then are requests switched off.
+   */
+
+  // ---- Spotify Web API (song requests) ----
+  function spApi(path, method) {
+    return new Promise((resolve, reject) => {
+      if (!S.token) return reject(new Error('no_token'));
+      GM_xmlhttpRequest({
+        method: method || 'GET', url: 'https://api.spotify.com/v1' + path, headers: { authorization: 'Bearer ' + S.token },
+        onload: (r) => { if (r.status === 429) return reject(new Error('rate_limited')); if (r.status === 401 || r.status === 403) return reject(new Error('premium_required')); try { resolve(r.responseText ? JSON.parse(r.responseText) : {}); } catch { resolve({}); } },
+        onerror: () => reject(new Error('network')),
+      });
+    });
+  }
+  // ---- INTERNAL endpoints (same ones the web UI uses) — NOT rate-limited like api.spotify.com ----
+  // searchTracks persisted-query hash from the web player. If Spotify rotates it the internal search
+  // 404s and we fall back to the public (rate-limited) search below.
+  const PF_HASH = '59ee4a659c32e9ad894a71308207594a65ba67bb6b632b183abe97303a51fa55';
+  function pfSearch(query) {
+    return new Promise((resolve) => {
+      if (!S.token) return resolve(null);
+      const headers = { authorization: 'Bearer ' + S.token, 'content-type': 'application/json;charset=UTF-8', accept: 'application/json', 'app-platform': 'WebPlayer' };
+      if (S.clientToken) headers['client-token'] = S.clientToken;
+      const data = JSON.stringify({ variables: { includePreReleases: false, includeAlbumPreReleases: false, numberOfTopResults: 5, searchTerm: String(query || ''), offset: 0, limit: 5, includeAudiobooks: false, includeAuthors: false, includeEpisodeContentRatingsV2: true }, operationName: 'searchTracks', extensions: { persistedQuery: { version: 1, sha256Hash: PF_HASH } } });
+      GM_xmlhttpRequest({
+        method: 'POST', url: 'https://api-partner.spotify.com/pathfinder/v2/query', headers, data,
+        onload: (r) => {
+          try {
+            const j = JSON.parse(r.responseText || '{}');
+            const items = j && j.data && j.data.searchV2 && j.data.searchV2.tracksV2 && j.data.searchV2.tracksV2.items;
+            const it = (items || []).map((x) => x && (x.item && x.item.data || x.data)).filter((x) => x && x.uri)[0];
+            if (!it) return resolve(null);
+            const cov = it.albumOfTrack && it.albumOfTrack.coverArt && it.albumOfTrack.coverArt.sources;
+            resolve({ uri: it.uri, name: it.name, artist: ((it.artists && it.artists.items) || []).map((a) => a && a.profile && a.profile.name).filter(Boolean).join(', '), image: (cov && (cov[0] || cov[1]) || {}).url || null });
+          } catch (e) { resolve(null); }
+        },
+        onerror: () => resolve(null),
+      });
+    });
+  }
+  function addToQueueInternal(uri) {
+    return new Promise((resolve) => {
+      if (!S.token || !S.spBase || !S.deviceId) return resolve(false);
+      const headers = { authorization: 'Bearer ' + S.token, 'content-type': 'application/json', accept: 'application/json' };
+      if (S.clientToken) headers['client-token'] = S.clientToken;
+      GM_xmlhttpRequest({
+        method: 'POST', url: S.spBase + '/connect-state/v1/player/command/from/' + S.deviceId + '/to/' + S.deviceId,
+        headers, data: JSON.stringify({ command: { endpoint: 'add_to_queue', track: { uri: String(uri), metadata: { is_queued: 'true' } } } }),
+        onload: (r) => resolve(r.status >= 200 && r.status < 300),
+        onerror: () => resolve(false),
+      });
+    });
+  }
+  async function queueByName(query) {
+    // Without the player's own token neither search can run. Saying "no match" there would blame
+    // the viewer for a request that was never actually made.
+    if (!S.token) return { ok: false, error: 'player_unavailable' };
+    // 1) find the track via the internal search (no rate limit); fall back to the public search
+    let t = await pfSearch(query);
+    if (!t || !t.uri) {
+      const s = await spApi('/search?type=track&limit=1&q=' + encodeURIComponent(query)).catch(() => null);
+      const p = s && s.tracks && s.tracks.items && s.tracks.items[0];
+      if (!p || !p.uri) return { ok: false, error: 'no_match' };
+      t = { uri: p.uri, name: p.name, artist: p.artists && p.artists[0] && p.artists[0].name, image: p.album && p.album.images && p.album.images[0] && p.album.images[0].url };
+    }
+    // 2) add it via the internal command (no rate limit); fall back to the public queue-add
+    let ok = await addToQueueInternal(t.uri);
+    if (!ok) { try { await spApi('/me/player/queue?uri=' + encodeURIComponent(t.uri), 'POST'); ok = true; } catch (e) { return { ok: false, error: 'queue_failed' }; } }
+    return { ok: true, added: { name: t.name, artist: t.artist, uri: t.uri, image: t.image } };
+  }
+
+  // ---- TokElements comms over GM_xmlhttpRequest (CSP-safe) ----
+  function te(method, path, body) {
+    return new Promise((resolve) => {
+      if (!S.teUrl || !S.pairCode) return resolve(null);
+      GM_xmlhttpRequest({
+        method, url: S.teUrl + path + (path.includes('?') ? '&' : '?') + 'code=' + encodeURIComponent(S.pairCode),
+        headers: { 'content-type': 'application/json' }, data: body ? JSON.stringify(body) : undefined,
+        onload: (r) => { S.online = r.status >= 200 && r.status < 500; try { resolve(r.responseText ? JSON.parse(r.responseText) : {}); } catch { resolve({}); } },
+        onerror: () => { S.online = false; resolve(null); },
+      });
+    });
+  }
+
+  // push now-playing on change; heartbeat every ~15s so TokElements keeps the link "connected" through
+  // pauses and song stops (the state route refreshes a 120s liveness key on every push).
+  let lastKey = '', lastSentAt = 0, loggedOutSince = 0;
+  async function pushLoop() {
+    const np = stableNP(); S.np = np;
+    const out = readLoggedOut();
+    // A few seconds of grace, so a slow render never shows up as "not signed in" in the studio.
+    if (out) { if (!loggedOutSince) loggedOutSince = Date.now(); } else loggedOutSince = 0;
+    S.loggedOut = !!loggedOutSince && Date.now() - loggedOutSince > 5000;
+    const key = JSON.stringify([np.track, np.artist, np.playing, Math.round((np.positionMs || 0) / 3000), S.premium, S.loggedOut, (S.queue || []).map((q) => q.uri)]);
+    const now = Date.now();
+    // The server keeps a pushed track for 45 seconds, so ten is frequent enough to survive a couple
+    // of failed requests without the overlay falling back to "nothing playing".
+    if (key !== lastKey || now - lastSentAt > 10000) {
+      lastKey = key; lastSentAt = now;
+      const r = await te('POST', '/api/spotify/agent/state', { nowPlaying: np, queue: S.queue, premium: S.premium, loggedOut: S.loggedOut, connected: true });
+      if (r) S.lastPushOk = now;
+    }
+    hud();
+  }
+  async function pollLoop() {
+    const r = await te('GET', '/api/spotify/agent/commands?since=' + S.seq);
+    if (r && r.commands) {
+      if (typeof r.seq === 'number') S.seq = r.seq;
+      for (const c of r.commands) {
+        let result;
+        if (c.type === 'control') result = { ok: await control(c.cmd) };
+        else if (c.type === 'queue') { if (S.premium === false) result = { ok: false, error: 'premium_required' }; else result = await queueByName(c.query).catch((e) => ({ ok: false, error: String(e.message || e) })); }
+        if (result && result.error === 'premium_required') S.premium = false;
+        S.lastResult = { at: Date.now(), type: c.type, ok: !!(result && result.ok), error: result && result.error, added: result && result.added };
+        hud();
+        await te('POST', '/api/spotify/agent/ack', { id: c.id, ...result });
+      }
+    }
+  }
+  setInterval(pushLoop, 1000);
+  setInterval(pollLoop, 2000);
+
+  // ---- pairing menu (for cross-browser / other computer) + reset ----
+  GM_registerMenuCommand('TokElements: set URL', () => { const v = prompt('TokElements URL', S.teUrl || 'https://app.tokelements.com'); if (v != null) { S.teUrl = v.trim().replace(/\/$/, ''); GM_setValue('teUrl', S.teUrl); hud(); } });
+  GM_registerMenuCommand('TokElements: set pairing code', () => { const v = prompt('Pairing code (from the TokElements Spotify page)', S.pairCode || ''); if (v != null) { S.pairCode = v.trim(); GM_setValue('pairCode', S.pairCode); hud(); } });
+  GM_registerMenuCommand('TokElements: check for updates', function () { window.open('https://raw.githubusercontent.com/tokelements/tokelements-spotify/main/tokelements-spotify.user.js', '_blank'); });
+  GM_registerMenuCommand('TokElements: reset / unpair', () => { S.pairCode = ''; GM_deleteValue('pairCode'); hud(); });
+
+  // ---- status HUD with real feedback (so streamers see what's happening) ----
+  let hudEl = null;
+  function hud() {
+    if (!document.body) return;
+    if (!hudEl) {
+      hudEl = document.createElement('div');
+      hudEl.style.cssText = 'position:fixed;z-index:99999;right:12px;bottom:96px;max-width:280px;min-width:212px;background:#121212f0;color:#fff;font:12px/1.45 system-ui,sans-serif;padding:10px 12px;border-radius:12px;box-shadow:0 8px 28px #0009;border:1px solid #1db95455';
+      document.body.appendChild(hudEl);
+    }
+    let dot = '#f0c674', label, sub = '';
+    if (!S.teUrl || !S.pairCode) { dot = '#888'; label = 'Not paired'; sub = 'Open TokElements → “Connect in this browser”, or menu → set code'; }
+    else if (S.online === false) { dot = '#e05555'; label = 'TokElements unreachable'; sub = 'Check the URL in the Tampermonkey menu'; }
+    else if (S.loggedOut) { dot = '#e05555'; label = 'Not signed in to Spotify'; sub = 'Log in on this tab — nothing can play or be queued until you do'; }
+    else if (!S.np || !S.np.track) { dot = '#f0c674'; label = 'Linked · waiting for a song'; sub = 'Play a track in this Spotify tab'; }
+    else { dot = '#1db954'; label = '♪ ' + String(S.np.track).slice(0, 34); sub = (S.np.playing ? 'Playing' : 'Paused') + (S.premium === false ? ' · no Premium, requests off' : '') + ' · sending to TokElements'; }
+    // The last thing a viewer asked for, so a streamer can see requests landing without leaving the tab.
+    let line = '';
+    if (S.lastResult && Date.now() - S.lastResult.at < 30000) {
+      const r = S.lastResult;
+      const what = r.type === 'control' ? (r.ok ? 'Skipped' : 'Skip failed') : r.ok ? ('Queued: ' + String((r.added && r.added.name) || 'track').slice(0, 28)) : ('Request failed: ' + (r.error || 'unknown'));
+      line = '<div style="margin-top:6px;padding-top:6px;border-top:1px solid #ffffff1a;font-size:11px;color:' + (r.ok ? '#8fdba4' : '#ff9aa2') + '">' + what + '</div>';
+    }
+    hudEl.innerHTML =
+      '<div style="display:flex;align-items:center;gap:7px;font-weight:700">' +
+      '<span style="width:8px;height:8px;border-radius:50%;background:' + dot + ';box-shadow:0 0 8px ' + dot + '"></span>' +
+      '<span style="color:#1db954">TokElements</span><span style="opacity:.85">· ' + label + '</span></div>' +
+      (sub ? '<div style="margin-top:4px;opacity:.6;font-size:11px">' + sub + '</div>' : '') + line;
+  }
+  hud();
+})();
