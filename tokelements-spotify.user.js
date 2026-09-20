@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TokElements for Spotify
 // @namespace    tokelements.spotify
-// @version      0.7.0
+// @version      0.7.1
 // @description  Drive your logged-in Spotify web player for TokElements (now-playing overlay + song requests + skip). No Spotify app / client-id needed. One-click pairing when TokElements runs in the same browser.
 // @author       TokElements
 // @homepageURL  https://github.com/tokelements/tokelements-spotify
@@ -51,7 +51,7 @@
   // ============================ ROLE 1: bridge on the TokElements page ============================
   if (IS_TE) {
     const post = (msg) => { try { window.postMessage(Object.assign({ __te_spotify_from: 'agent' }, msg), location.origin); } catch (e) {} };
-    const announce = () => post({ __te_spotify: 'agent-present', version: '0.7.0' });
+    const announce = () => post({ __te_spotify: 'agent-present', version: '0.7.1' });
     // keep announcing briefly so the page shows the one-click button even if we loaded first
     announce();
     let n = 0; const iv = setInterval(() => { announce(); if (++n > 12) clearInterval(iv); }, 1200);
@@ -306,8 +306,35 @@
     }
     // 2) add it via the internal command (no rate limit); fall back to the public queue-add
     let ok = await addToQueueInternal(t.uri);
-    if (!ok) { try { await spApi('/me/player/queue?uri=' + encodeURIComponent(t.uri), 'POST'); ok = true; } catch (e) { return { ok: false, error: 'queue_failed' }; } }
+    // The reason travels: this used to answer "queue_failed" for everything, so a free account was
+    // told Spotify refused the track instead of that requests need Premium.
+    if (!ok) { try { await spApi('/me/player/queue?uri=' + encodeURIComponent(t.uri), 'POST'); ok = true; } catch (e) { return { ok: false, error: String((e && e.message) || 'queue_failed') }; } }
     return { ok: true, added: { name: t.name, artist: t.artist, uri: t.uri, image: t.image } };
+  }
+
+  /*
+   * Free or Premium, asked once.
+   *
+   * Queueing a track is a Premium feature, on the internal command as much as on the public API. Until
+   * now that only surfaced when a viewer had already paid points for a request, as a failure with no
+   * explanation. The web player's own token answers it in one request, and the answer travels to
+   * TokElements: the studio page and the request widget both already say "needs Premium" when they
+   * are told. A non-200 (an expired token, no network) leaves the answer at "unknown" and is asked again.
+   */
+  let probing = false, probedAt = 0;
+  function probeProduct() {
+    if (probing || !S.token || Date.now() - probedAt < 30 * 60_000) return;
+    probing = true;
+    GM_xmlhttpRequest({
+      method: 'GET', url: 'https://api.spotify.com/v1/me', headers: { authorization: 'Bearer ' + S.token },
+      onload: (r) => {
+        probing = false;
+        if (r.status !== 200) return;
+        probedAt = Date.now();
+        try { const j = JSON.parse(r.responseText || '{}'); if (j.product) { S.premium = j.product === 'premium'; hud(); } } catch {}
+      },
+      onerror: () => { probing = false; },
+    });
   }
 
   // ---- one tab speaks for the player ----
@@ -365,6 +392,7 @@
     S.loggedOut = !!loggedOutSince && Date.now() - loggedOutSince > 5000;
     electLeader();
     if (!S.leader) { hud(); return; }
+    probeProduct();
     const key = JSON.stringify([np.track, np.artist, np.playing, Math.round((np.positionMs || 0) / 3000), S.premium, S.loggedOut, (S.queue || []).map((q) => q.uri)]);
     const now = Date.now();
     // The server keeps a pushed track for 45 seconds, so ten is frequent enough to survive a couple
@@ -418,6 +446,7 @@
     else if (S.online === false) { dot = tone = '#ff6a6a'; title = 'TokElements unreachable'; sub = 'Check the URL in the Tampermonkey menu'; }
     else if (!S.leader) { dot = tone = '#8a8b96'; title = 'Another Spotify tab is sending'; sub = 'This tab takes over when it plays'; }
     else if (S.loggedOut) { dot = tone = '#ff6a6a'; title = 'Not signed in to Spotify'; sub = 'Log in on this tab to play and queue'; }
+    else if (S.premium === false) { dot = tone = '#ffcf5a'; title = 'Spotify Premium required'; sub = 'Song requests need Premium · now playing still works'; }
     else if (!S.np || !S.np.track) { title = 'Waiting for a song'; sub = 'Play a track in this tab'; }
     else {
       dot = tone = S.np.playing ? '#1db954' : '#c9c9d0';
