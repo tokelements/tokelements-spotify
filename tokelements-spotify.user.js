@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TokElements for Spotify
 // @namespace    tokelements.spotify
-// @version      0.6.0
+// @version      0.7.0
 // @description  Drive your logged-in Spotify web player for TokElements (now-playing overlay + song requests + skip). No Spotify app / client-id needed. One-click pairing when TokElements runs in the same browser.
 // @author       TokElements
 // @homepageURL  https://github.com/tokelements/tokelements-spotify
@@ -51,7 +51,7 @@
   // ============================ ROLE 1: bridge on the TokElements page ============================
   if (IS_TE) {
     const post = (msg) => { try { window.postMessage(Object.assign({ __te_spotify_from: 'agent' }, msg), location.origin); } catch (e) {} };
-    const announce = () => post({ __te_spotify: 'agent-present', version: '0.6.0' });
+    const announce = () => post({ __te_spotify: 'agent-present', version: '0.7.0' });
     // keep announcing briefly so the page shows the one-click button even if we loaded first
     announce();
     let n = 0; const iv = setInterval(() => { announce(); if (++n > 12) clearInterval(iv); }, 1200);
@@ -81,6 +81,7 @@
     queue: [],           // up-next tracks captured from the web player's internal state (no rate limit)
     online: null,        // last TokElements POST reachable?
     lastPushOk: 0,
+    leader: true, others: 0,
   };
   // live-update when the bridge (TokElements page) pairs/unpairs in another tab
   if (typeof GM_addValueChangeListener === 'function') {
@@ -309,6 +310,37 @@
     return { ok: true, added: { name: t.name, artist: t.artist, uri: t.uri, image: t.image } };
   }
 
+  // ---- one tab speaks for the player ----
+  /*
+   * Two or three Spotify tabs each ran this script, each pushed what it saw and each took song
+   * requests from the queue: a tab with nothing playing reported "nothing playing" over the song in
+   * the other, and a request was handled by whichever tab polled first. The tabs keep a roster in GM
+   * storage (shared across tabs) and agree on one leader: the tab that is playing; otherwise one with
+   * a track loaded; otherwise the one used most recently. The leader keeps the role until another
+   * tab has a better claim, so a pause does not flip it. Only the leader pushes and takes commands.
+   */
+  const TAB = sessionStorage.getItem('__te_spotify_tab') || Math.random().toString(36).slice(2, 10);
+  sessionStorage.setItem('__te_spotify_tab', TAB);
+  let focusedAt = document.hasFocus() ? Date.now() : 0;
+  window.addEventListener('focus', () => { focusedAt = Date.now(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) focusedAt = Date.now(); });
+  function electLeader() {
+    const now = Date.now(); let r;
+    try { r = JSON.parse(GM_getValue('tabs', '{}') || '{}'); } catch { r = {}; }
+    r[TAB] = { at: now, playing: !!(S.np && S.np.track && S.np.playing), track: !!(S.np && S.np.track), focus: focusedAt };
+    const alive = {}, ids = [];
+    for (const id in r) if (now - (r[id].at || 0) < 8000) { alive[id] = r[id]; ids.push(id); }
+    GM_setValue('tabs', JSON.stringify(alive));
+    ids.sort((a, b) => { const A = alive[a], B = alive[b]; return (B.playing - A.playing) || (B.track - A.track) || (B.focus - A.focus) || (a < b ? -1 : 1); });
+    let best = ids[0]; const lead = GM_getValue('leader', ''), cur = alive[lead];
+    if (cur && best !== lead && (cur.playing || !alive[best].playing) && (cur.track || !alive[best].track)) best = lead;
+    if (best === TAB && lead !== TAB) GM_setValue('leader', TAB);
+    const was = S.leader;
+    S.leader = best === TAB;
+    S.others = ids.length - 1;
+    if (S.leader && !was) lastKey = '';        // taking over: push at once, whatever the last push was
+  }
+
   // ---- TokElements comms over GM_xmlhttpRequest (CSP-safe) ----
   function te(method, path, body) {
     return new Promise((resolve) => {
@@ -331,6 +363,8 @@
     // A few seconds of grace, so a slow render never shows up as "not signed in" in the studio.
     if (out) { if (!loggedOutSince) loggedOutSince = Date.now(); } else loggedOutSince = 0;
     S.loggedOut = !!loggedOutSince && Date.now() - loggedOutSince > 5000;
+    electLeader();
+    if (!S.leader) { hud(); return; }
     const key = JSON.stringify([np.track, np.artist, np.playing, Math.round((np.positionMs || 0) / 3000), S.premium, S.loggedOut, (S.queue || []).map((q) => q.uri)]);
     const now = Date.now();
     // The server keeps a pushed track for 45 seconds, so ten is frequent enough to survive a couple
@@ -343,6 +377,7 @@
     hud();
   }
   async function pollLoop() {
+    if (!S.leader) return;
     const r = await te('GET', '/api/spotify/agent/commands?since=' + S.seq);
     if (r && r.commands) {
       if (typeof r.seq === 'number') S.seq = r.seq;
@@ -366,33 +401,48 @@
   GM_registerMenuCommand('TokElements: check for updates', function () { window.open('https://raw.githubusercontent.com/tokelements/tokelements-spotify/main/tokelements-spotify.user.js', '_blank'); });
   GM_registerMenuCommand('TokElements: reset / unpair', () => { S.pairCode = ''; GM_deleteValue('pairCode'); hud(); });
 
-  // ---- status HUD with real feedback (so streamers see what's happening) ----
-  let hudEl = null;
+  // ---- status card, so a streamer can see what is happening without opening a console ----
+  // Sits above Spotify's player bar. A click folds it to a dot; the choice is kept across tabs.
+  let hudEl = null, hudMin = !!GM_getValue('hudMin', false);
+  const esc = (x) => String(x == null ? '' : x).replace(/[<>&]/g, (c) => (c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;'));
   function hud() {
     if (!document.body) return;
     if (!hudEl) {
       hudEl = document.createElement('div');
-      hudEl.style.cssText = 'position:fixed;z-index:99999;right:12px;bottom:96px;max-width:280px;min-width:212px;background:#121212f0;color:#fff;font:12px/1.45 system-ui,sans-serif;padding:10px 12px;border-radius:12px;box-shadow:0 8px 28px #0009;border:1px solid #1db95455';
+      hudEl.setAttribute('title', 'TokElements · click to fold');
+      hudEl.addEventListener('click', () => { hudMin = !hudMin; GM_setValue('hudMin', hudMin); hud(); });
       document.body.appendChild(hudEl);
     }
-    let dot = '#f0c674', label, sub = '';
-    if (!S.teUrl || !S.pairCode) { dot = '#888'; label = 'Not paired'; sub = 'Open TokElements → “Connect in this browser”, or menu → set code'; }
-    else if (S.online === false) { dot = '#e05555'; label = 'TokElements unreachable'; sub = 'Check the URL in the Tampermonkey menu'; }
-    else if (S.loggedOut) { dot = '#e05555'; label = 'Not signed in to Spotify'; sub = 'Log in on this tab — nothing can play or be queued until you do'; }
-    else if (!S.np || !S.np.track) { dot = '#f0c674'; label = 'Linked · waiting for a song'; sub = 'Play a track in this Spotify tab'; }
-    else { dot = '#1db954'; label = '♪ ' + String(S.np.track).slice(0, 34); sub = (S.np.playing ? 'Playing' : 'Paused') + (S.premium === false ? ' · no Premium, requests off' : '') + ' · sending to TokElements'; }
-    // The last thing a viewer asked for, so a streamer can see requests landing without leaving the tab.
+    let dot = '#f0c674', tone = '#f0c674', title = '', sub = '';
+    if (!S.teUrl || !S.pairCode) { dot = tone = '#8a8b96'; title = 'Not paired'; sub = 'Open TokElements → Connect in this browser'; }
+    else if (S.online === false) { dot = tone = '#ff6a6a'; title = 'TokElements unreachable'; sub = 'Check the URL in the Tampermonkey menu'; }
+    else if (!S.leader) { dot = tone = '#8a8b96'; title = 'Another Spotify tab is sending'; sub = 'This tab takes over when it plays'; }
+    else if (S.loggedOut) { dot = tone = '#ff6a6a'; title = 'Not signed in to Spotify'; sub = 'Log in on this tab to play and queue'; }
+    else if (!S.np || !S.np.track) { title = 'Waiting for a song'; sub = 'Play a track in this tab'; }
+    else {
+      dot = tone = S.np.playing ? '#1db954' : '#c9c9d0';
+      title = String(S.np.track);
+      sub = (S.np.playing ? 'Playing' : 'Paused') + ' · sending to TokElements' + (S.premium === false ? ' · no Premium, requests off' : '') + (S.others ? ' · ' + S.others + ' other tab' + (S.others > 1 ? 's' : '') + ' quiet' : '');
+    }
     let line = '';
     if (S.lastResult && Date.now() - S.lastResult.at < 30000) {
       const r = S.lastResult;
-      const what = r.type === 'control' ? (r.ok ? 'Skipped' : 'Skip failed') : r.ok ? ('Queued: ' + String((r.added && r.added.name) || 'track').slice(0, 28)) : ('Request failed: ' + (r.error || 'unknown'));
-      line = '<div style="margin-top:6px;padding-top:6px;border-top:1px solid #ffffff1a;font-size:11px;color:' + (r.ok ? '#8fdba4' : '#ff9aa2') + '">' + what + '</div>';
+      const what = r.type === 'control' ? (r.ok ? 'Skipped' : 'Skip failed') : r.ok ? ('Queued · ' + String((r.added && r.added.name) || 'track')) : ('Request failed · ' + (r.error || 'unknown'));
+      line = '<div style="margin-top:7px;padding-top:7px;border-top:1px solid #ffffff14;font-size:11px;font-weight:600;color:' + (r.ok ? '#7ed6a0' : '#ff8c96') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(what) + '</div>';
     }
+    const base = 'position:fixed;z-index:99999;right:14px;bottom:100px;color:#fff;font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;cursor:pointer;user-select:none;transition:opacity .2s;';
+    if (hudMin) {
+      hudEl.style.cssText = base + 'display:flex;align-items:center;gap:7px;height:28px;padding:0 10px 0 9px;border-radius:14px;background:#141418f2;border:1px solid #ffffff1f;box-shadow:0 6px 20px #0008;font-size:11px;font-weight:700;letter-spacing:.04em;';
+      hudEl.innerHTML = '<span style="width:7px;height:7px;border-radius:50%;background:' + dot + ';box-shadow:0 0 6px ' + dot + '"></span><span style="color:#fff;opacity:.85">TE</span>';
+      return;
+    }
+    hudEl.style.cssText = base + 'width:272px;padding:10px 12px 11px 14px;border-radius:12px;background:#141418f2;backdrop-filter:blur(8px);border:1px solid #ffffff1a;box-shadow:0 10px 30px #000a,inset 3px 0 0 ' + tone + ';';
     hudEl.innerHTML =
-      '<div style="display:flex;align-items:center;gap:7px;font-weight:700">' +
-      '<span style="width:8px;height:8px;border-radius:50%;background:' + dot + ';box-shadow:0 0 8px ' + dot + '"></span>' +
-      '<span style="color:#1db954">TokElements</span><span style="opacity:.85">· ' + label + '</span></div>' +
-      (sub ? '<div style="margin-top:4px;opacity:.6;font-size:11px">' + sub + '</div>' : '') + line;
+      '<div style="display:flex;align-items:center;gap:7px;font-size:10.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#ffffff99">' +
+      '<span style="width:7px;height:7px;border-radius:50%;background:' + dot + ';box-shadow:0 0 7px ' + dot + '"></span>TokElements' +
+      '<span style="margin-left:auto;font-weight:600;letter-spacing:0;text-transform:none;color:#ffffff55">Spotify</span></div>' +
+      '<div style="margin-top:5px;font-size:13px;font-weight:700;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(title) + '</div>' +
+      (sub ? '<div style="margin-top:2px;font-size:11px;color:#ffffff80;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(sub) + '</div>' : '') + line;
   }
   hud();
 })();
