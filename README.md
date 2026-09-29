@@ -145,6 +145,10 @@ goals, leaderboards, games, counters. You can write widgets yourself in HTML, CS
 describe one in a sentence and have the assistant build it.
 
 - **Website** — [tokelements.com](https://tokelements.com)
+- **Video tutorial** — [Connect Spotify to your TikTok LIVE overlay](https://www.youtube.com/watch?v=458Kc_OS8wQ)
+- **Overlays for TikTok LIVE Studio** — [tokelements.com/tiktok-live-studio](https://tokelements.com/tiktok-live-studio)
+- **TikTok LIVE overlays for OBS** — [tokelements.com/tiktok-overlay](https://tokelements.com/tiktok-overlay)
+- **Build widgets from Claude or ChatGPT (MCP server)** — [tokelements.com/integrations](https://tokelements.com/integrations)
 - **Widget documentation** — [tokelements.com/docs](https://tokelements.com/docs)
 - **Widget kits other creators published** — [tokelements.com/kits](https://tokelements.com/kits)
 - **SoundCloud instead of Spotify** — [tokelements-soundcloud](https://github.com/tokelements/tokelements-soundcloud)
